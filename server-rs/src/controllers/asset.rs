@@ -21,6 +21,7 @@ use crate::{
     error::AppError,
     middleware::auth::AuthDto,
     jobs::Job,
+    ml,
     models::Asset,
     AppState,
 };
@@ -254,9 +255,45 @@ async fn upload_asset(
         }
     }
 
-    let _ = state.job_queue.sender.send(Job::ExtractMetadata {
-        asset_id: asset_id.clone(),
-    }).await;
+    let _ = state
+        .job_queue
+        .enqueue(Job::ExtractMetadata {
+            id: Uuid::new_v4().to_string(),
+            asset_id: asset_id.clone(),
+        })
+        .await;
+
+    if let Ok(config) = ml::load_ml_config(&state).await {
+        if config.enabled {
+            if config.clip_enabled {
+                let _ = state
+                    .job_queue
+                    .enqueue(Job::SmartSearch {
+                        id: Uuid::new_v4().to_string(),
+                        asset_id: asset_id.clone(),
+                    })
+                    .await;
+            }
+            if config.facial_enabled {
+                let _ = state
+                    .job_queue
+                    .enqueue(Job::DetectFaces {
+                        id: Uuid::new_v4().to_string(),
+                        asset_id: asset_id.clone(),
+                    })
+                    .await;
+            }
+            if config.ocr_enabled {
+                let _ = state
+                    .job_queue
+                    .enqueue(Job::Ocr {
+                        id: Uuid::new_v4().to_string(),
+                        asset_id: asset_id.clone(),
+                    })
+                    .await;
+            }
+        }
+    }
 
     Ok((
         StatusCode::CREATED,
@@ -643,6 +680,22 @@ async fn load_asset(state: &AppState, owner_id: &str, asset_id: &str) -> Result<
     .ok_or_else(|| AppError::BadRequest("Asset not found".to_string()))
 }
 
+async fn load_asset_by_id(state: &AppState, asset_id: &str) -> Result<Asset, AppError> {
+    sqlx::query_as::<_, Asset>(
+        &format!(
+            r#"
+            SELECT {ASSET_SELECT_COLUMNS}
+            FROM "asset"
+            WHERE "id" = $1::uuid
+            "#
+        ),
+    )
+    .bind(asset_id)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or_else(|| AppError::BadRequest("Asset not found".to_string()))
+}
+
 async fn serve_file(path: String, file_name: String, attachment: bool) -> Result<Response, AppError> {
     let bytes = tokio::fs::read(&path).await.map_err(|e| AppError::InternalServerError(e.into()))?;
     let mut headers = HeaderMap::new();
@@ -874,6 +927,215 @@ async fn generate_initial_media(state: &AppState, asset: &Asset) -> Result<(), A
     }
     if asset.r#type.eq_ignore_ascii_case("VIDEO") {
         let _ = ensure_encoded_video(state, asset, &config).await?;
+    }
+    Ok(())
+}
+
+pub(crate) async fn run_media_job(state: &AppState, job: &Job) -> Result<(), AppError> {
+    match job {
+        Job::ExtractMetadata { asset_id, .. } => {
+            let _asset = load_asset_by_id(state, asset_id).await?;
+            sqlx::query(
+                r#"
+                INSERT INTO asset_job_status ("assetId", "metadataExtractedAt")
+                VALUES ($1::uuid, now())
+                ON CONFLICT ("assetId")
+                DO UPDATE SET "metadataExtractedAt" = EXCLUDED."metadataExtractedAt"
+                "#,
+            )
+            .bind(asset_id)
+            .execute(&state.db)
+            .await?;
+        }
+        Job::GenerateThumbnail { asset_id, .. } => {
+            let asset = load_asset_by_id(state, asset_id).await?;
+            generate_initial_media(state, &asset).await?;
+        }
+        Job::TranscodeVideo { asset_id, .. } => {
+            let asset = load_asset_by_id(state, asset_id).await?;
+            let config = load_media_config(state).await?;
+            let _ = ensure_encoded_video(state, &asset, &config).await?;
+        }
+        Job::SmartSearch { asset_id, .. } => {
+            let asset = load_asset_by_id(state, asset_id).await?;
+            let config = ml::load_ml_config(state).await?;
+            if !config.clip_enabled {
+                return Ok(());
+            }
+            let entries = serde_json::json!({
+                "clip": {
+                    "visual": { "modelName": config.clip_model_name }
+                }
+            });
+            let response = ml::predict_image(state, entries, &asset.original_path).await?;
+            let embedding = response
+                .get("clip")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| AppError::BadRequest("Missing ML embedding".to_string()))?;
+            sqlx::query(
+                r#"
+                INSERT INTO smart_search ("assetId", embedding)
+                VALUES ($1::uuid, $2::vectors.vector)
+                ON CONFLICT ("assetId")
+                DO UPDATE SET embedding = EXCLUDED.embedding
+                "#,
+            )
+            .bind(asset_id)
+            .bind(embedding)
+            .execute(&state.db)
+            .await?;
+        }
+        Job::DetectFaces { asset_id, .. } => {
+            let asset = load_asset_by_id(state, asset_id).await?;
+            let config = ml::load_ml_config(state).await?;
+            if !config.facial_enabled {
+                return Ok(());
+            }
+            let entries = serde_json::json!({
+                "facial-recognition": {
+                    "detection": { "modelName": config.facial_model_name, "options": { "minScore": config.facial_min_score } },
+                    "recognition": { "modelName": config.facial_model_name }
+                }
+            });
+            let response = ml::predict_image(state, entries, &asset.original_path).await?;
+            let faces = response
+                .get("facial-recognition")
+                .and_then(|value| value.as_array())
+                .ok_or_else(|| AppError::BadRequest("Missing face data".to_string()))?;
+            let image_width = response.get("imageWidth").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+            let image_height = response.get("imageHeight").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+
+            sqlx::query(r#"DELETE FROM asset_face WHERE "assetId" = $1::uuid"#)
+                .bind(asset_id)
+                .execute(&state.db)
+                .await?;
+
+            for face in faces {
+                let bbox = face.get("boundingBox").and_then(|v| v.as_object()).ok_or_else(|| {
+                    AppError::BadRequest("Missing face bounding box".to_string())
+                })?;
+                let embedding = face
+                    .get("embedding")
+                    .and_then(|value| value.as_str())
+                    .ok_or_else(|| AppError::BadRequest("Missing face embedding".to_string()))?;
+
+                let face_id: String = sqlx::query_scalar(
+                    r#"
+                    INSERT INTO asset_face ("assetId", "imageWidth", "imageHeight", "boundingBoxX1", "boundingBoxY1", "boundingBoxX2", "boundingBoxY2")
+                    VALUES ($1::uuid, $2, $3, $4, $5, $6, $7)
+                    RETURNING id::text
+                    "#,
+                )
+                .bind(asset_id)
+                .bind(image_width)
+                .bind(image_height)
+                .bind(bbox.get("x1").and_then(|v| v.as_f64()).unwrap_or(0.0) as i32)
+                .bind(bbox.get("y1").and_then(|v| v.as_f64()).unwrap_or(0.0) as i32)
+                .bind(bbox.get("x2").and_then(|v| v.as_f64()).unwrap_or(0.0) as i32)
+                .bind(bbox.get("y2").and_then(|v| v.as_f64()).unwrap_or(0.0) as i32)
+                .fetch_one(&state.db)
+                .await?;
+
+                sqlx::query(
+                    r#"
+                    INSERT INTO face_search ("faceId", embedding)
+                    VALUES ($1::uuid, $2::vectors.vector)
+                    ON CONFLICT ("faceId")
+                    DO UPDATE SET embedding = EXCLUDED.embedding
+                    "#,
+                )
+                .bind(face_id)
+                .bind(embedding)
+                .execute(&state.db)
+                .await?;
+            }
+
+            sqlx::query(
+                r#"
+                INSERT INTO asset_job_status ("assetId", "facesRecognizedAt")
+                VALUES ($1::uuid, now())
+                ON CONFLICT ("assetId")
+                DO UPDATE SET "facesRecognizedAt" = EXCLUDED."facesRecognizedAt"
+                "#,
+            )
+            .bind(asset_id)
+            .execute(&state.db)
+            .await?;
+        }
+        Job::Ocr { asset_id, .. } => {
+            let asset = load_asset_by_id(state, asset_id).await?;
+            let config = ml::load_ml_config(state).await?;
+            if !config.ocr_enabled {
+                return Ok(());
+            }
+            let entries = serde_json::json!({
+                "ocr": {
+                    "detection": { "modelName": config.ocr_model_name, "options": { "minScore": config.ocr_min_detection_score, "maxResolution": config.ocr_max_resolution } },
+                    "recognition": { "modelName": config.ocr_model_name, "options": { "minScore": config.ocr_min_recognition_score } }
+                }
+            });
+            let response = ml::predict_image(state, entries, &asset.original_path).await?;
+            let ocr = response
+                .get("ocr")
+                .and_then(|value| value.as_object())
+                .ok_or_else(|| AppError::BadRequest("Missing OCR data".to_string()))?;
+
+            let texts = ocr.get("text").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+            let boxes = ocr.get("box").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+            let box_scores = ocr.get("boxScore").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+            let text_scores = ocr.get("textScore").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+
+            sqlx::query(r#"DELETE FROM asset_ocr WHERE "assetId" = $1::uuid"#)
+                .bind(asset_id)
+                .execute(&state.db)
+                .await?;
+
+            let mut box_values = boxes.iter().filter_map(|v| v.as_f64()).collect::<Vec<_>>();
+            let mut offset = 0usize;
+            for (idx, text) in texts.iter().enumerate() {
+                if offset + 7 >= box_values.len() {
+                    break;
+                }
+                let text_value = text.as_str().unwrap_or("").to_string();
+                let box_score = box_scores.get(idx).and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+                let text_score = text_scores.get(idx).and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+
+                sqlx::query(
+                    r#"
+                    INSERT INTO asset_ocr ("assetId", x1, y1, x2, y2, x3, y3, x4, y4, "boxScore", "textScore", text)
+                    VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                    "#,
+                )
+                .bind(asset_id)
+                .bind(box_values[offset] as f32)
+                .bind(box_values[offset + 1] as f32)
+                .bind(box_values[offset + 2] as f32)
+                .bind(box_values[offset + 3] as f32)
+                .bind(box_values[offset + 4] as f32)
+                .bind(box_values[offset + 5] as f32)
+                .bind(box_values[offset + 6] as f32)
+                .bind(box_values[offset + 7] as f32)
+                .bind(box_score)
+                .bind(text_score)
+                .bind(text_value)
+                .execute(&state.db)
+                .await?;
+
+                offset += 8;
+            }
+
+            sqlx::query(
+                r#"
+                INSERT INTO asset_job_status ("assetId", "ocrAt")
+                VALUES ($1::uuid, now())
+                ON CONFLICT ("assetId")
+                DO UPDATE SET "ocrAt" = EXCLUDED."ocrAt"
+                "#,
+            )
+            .bind(asset_id)
+            .execute(&state.db)
+            .await?;
+        }
     }
     Ok(())
 }

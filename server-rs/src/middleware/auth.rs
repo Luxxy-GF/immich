@@ -30,6 +30,46 @@ where
 
         let mut token = None;
 
+        // API key authentication
+        if let Some(api_key) = parts.headers.get("x-api-key") {
+            if let Ok(api_key) = api_key.to_str() {
+                let hashed_key = hash_sha256(api_key);
+                let user_id = sqlx::query_scalar::<_, String>(
+                    r#"
+                    SELECT "userId"::text
+                    FROM api_key
+                    WHERE key = $1
+                    "#,
+                )
+                .bind(hashed_key)
+                .fetch_optional(&app_state.db)
+                .await
+                .map_err(|e| AppError::InternalServerError(e.into()))?
+                .ok_or_else(|| AppError::BadRequest("Invalid API key".to_string()))?;
+
+                let user: User = sqlx::query_as::<_, User>(
+                    r#"
+                    SELECT
+                        "id"::text as "id", "name", "email", "avatarColor", "profileImagePath", "profileChangedAt",
+                        "storageLabel", "shouldChangePassword", "isAdmin", "createdAt", "updatedAt", "deletedAt",
+                        "oauthId", "quotaSizeInBytes", "quotaUsageInBytes", "status", "password", "pinCode"
+                    FROM "user"
+                    WHERE "id" = $1::uuid AND "deletedAt" IS NULL
+                    "#,
+                )
+                .bind(&user_id)
+                .fetch_optional(&app_state.db)
+                .await
+                .map_err(|e| AppError::InternalServerError(e.into()))?
+                .ok_or_else(|| AppError::BadRequest("User not found".to_string()))?;
+
+                return Ok(AuthDto {
+                    user,
+                    session: None,
+                });
+            }
+        }
+
         // Check x-immich-user-token or x-immich-session-token
         if let Some(h) = parts.headers.get("x-immich-user-token") {
             token = h.to_str().ok().map(String::from);

@@ -8,7 +8,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::Row;
 
-use crate::{error::AppError, middleware::auth::AuthDto, AppState};
+use crate::{error::AppError, middleware::auth::AuthDto, ml, AppState};
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -164,7 +164,87 @@ async fn search_smart(
     auth: AuthDto,
     Json(query): Json<SearchQuery>,
 ) -> Result<Json<Value>, AppError> {
-    search_metadata(State(state), auth, Json(query)).await
+    let text = query.name.clone().unwrap_or_default();
+    if text.is_empty() {
+        return search_metadata(State(state), auth, Json(query)).await;
+    }
+
+    let config = ml::load_ml_config(&state).await?;
+    if !config.clip_enabled {
+        return search_metadata(State(state), auth, Json(query)).await;
+    }
+
+    let entries = json!({
+        "clip": {
+            "textual": {
+                "modelName": config.clip_model_name,
+                "options": { "language": "en" }
+            }
+        }
+    });
+    let response = ml::predict_text(&state, entries, &text).await?;
+    let embedding = response
+        .get("clip")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| AppError::BadRequest("Missing ML embedding".to_string()))?;
+
+    let size = query.size.unwrap_or(250);
+    let page = query.page.unwrap_or(1).max(1);
+    let offset = (page - 1) * size;
+    let visibility = query.visibility.clone().unwrap_or_else(|| "timeline".to_string());
+
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            a."id"::text as id,
+            a."type",
+            a.thumbhash,
+            a."localDateTime",
+            a.duration,
+            a.width,
+            a.height,
+            a."createdAt",
+            a."deviceAssetId",
+            a."deviceId",
+            a."ownerId"::text as "ownerId",
+            a."originalPath",
+            a."originalFileName",
+            a."fileCreatedAt",
+            a."fileModifiedAt",
+            a."updatedAt",
+            a."isFavorite",
+            a."deletedAt",
+            a."isOffline",
+            a.visibility::text as visibility,
+            a.checksum
+        FROM asset a
+        JOIN asset_exif ex ON ex."assetId" = a.id
+        JOIN smart_search ss ON ss."assetId" = a.id
+        WHERE a."ownerId" = $1::uuid
+          AND a."deletedAt" IS NULL
+          AND a.visibility::text = $2
+        ORDER BY ss.embedding <=> $3::vectors.vector
+        LIMIT $4 OFFSET $5
+        "#,
+    )
+    .bind(&auth.user.id)
+    .bind(visibility)
+    .bind(embedding)
+    .bind(size)
+    .bind(offset)
+    .fetch_all(&state.db)
+    .await?;
+
+    Ok(Json(json!({
+        "albums": { "total": 0, "count": 0, "items": [], "facets": [] },
+        "assets": {
+            "total": rows.len(),
+            "count": rows.len(),
+            "items": rows.into_iter().map(asset_row_to_json).collect::<Vec<_>>(),
+            "facets": [],
+            "nextPage": Value::Null
+        }
+    })))
 }
 
 async fn get_explore(

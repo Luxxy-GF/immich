@@ -6,6 +6,7 @@ pub mod crypto;
 pub mod middleware;
 pub mod models;
 pub mod jobs;
+pub mod ml;
 
 use axum::{extract::DefaultBodyLimit, Router};
 use sqlx::postgres::PgPoolOptions;
@@ -56,16 +57,19 @@ async fn main() -> anyhow::Result<()> {
     let (job_queue, receiver) = JobQueue::new();
     let job_queue = Arc::new(job_queue);
 
-    tokio::spawn(async move {
-        run_worker(receiver).await;
-    });
-
     let state = AppState {
         db: pool,
-        job_queue,
+        job_queue: job_queue.clone(),
         media_location: cfg.media_location,
         web_root: cfg.web_root.clone(),
     };
+
+    tokio::spawn({
+        let worker_state = state.clone();
+        async move {
+            run_worker(receiver, worker_state).await;
+        }
+    });
 
     let web_root = PathBuf::from(cfg.web_root);
     let index_html = web_root.join("index.html");
