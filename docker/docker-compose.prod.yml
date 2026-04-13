@@ -25,6 +25,7 @@ services:
     environment:
       PORT: 2283
       IMMICH_MEDIA_LOCATION: /data
+      IMMICH_WEB_ROOT: /usr/share/immich-web
       DB_URL: postgres://${DB_USERNAME}:${DB_PASSWORD}@database:5432/${DB_DATABASE_NAME}
       REDIS_HOSTNAME: ${REDIS_HOSTNAME:-redis}
       REDIS_PORT: ${REDIS_PORT:-6379}
@@ -44,15 +45,6 @@ services:
     restart: always
     healthcheck:
       disable: false
-
-  immich-web:
-    container_name: immich_web
-    image: ghcr.io/luxxy-gf/immich-rs/immich-web:latest
-    depends_on:
-      - immich-server
-    ports:
-      - 3000:3000
-    restart: always
 
   immich-machine-learning:
     container_name: immich_machine_learning

@@ -20,6 +20,23 @@ COPY server/package.json /usr/src/app/server/package.json
 
 RUN cargo clean && cargo build --release --locked
 
+FROM node:24-bookworm AS web-builder
+
+ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0
+
+RUN corepack enable pnpm
+
+WORKDIR /usr/src/app
+
+COPY package.json pnpm-workspace.yaml pnpm-lock.yaml .pnpmfile.cjs ./
+COPY open-api/typescript-sdk ./open-api/typescript-sdk
+COPY i18n ./i18n
+COPY web ./web
+
+RUN pnpm install --filter @immich/sdk --filter immich-web --frozen-lockfile
+RUN pnpm --filter @immich/sdk build
+RUN pnpm --filter immich-web build
+
 FROM debian:bookworm-slim
 
 RUN apt-get update && \
@@ -29,9 +46,11 @@ RUN apt-get update && \
 WORKDIR /usr/src/app
 
 COPY --from=builder /usr/src/app/server-rs/target/release/server-rs /usr/local/bin/server-rs
+COPY --from=web-builder /usr/src/app/web/build /usr/share/immich-web
 
 ENV PORT=2283 \
-    IMMICH_MEDIA_LOCATION=/data
+    IMMICH_MEDIA_LOCATION=/data \
+    IMMICH_WEB_ROOT=/usr/share/immich-web
 
 VOLUME /data
 EXPOSE 2283

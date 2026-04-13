@@ -10,8 +10,10 @@ pub mod jobs;
 use axum::{extract::DefaultBodyLimit, Router};
 use sqlx::postgres::PgPoolOptions;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tower_http::trace::TraceLayer;
+use tower_http::services::{ServeDir, ServeFile};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use jobs::{JobQueue, run_worker};
@@ -21,6 +23,7 @@ pub struct AppState {
     pub db: sqlx::PgPool,
     pub job_queue: Arc<JobQueue>,
     pub media_location: String,
+    pub web_root: String,
 }
 
 #[tokio::main]
@@ -57,7 +60,15 @@ async fn main() -> anyhow::Result<()> {
         run_worker(receiver).await;
     });
 
-    let state = AppState { db: pool, job_queue, media_location: cfg.media_location };
+    let state = AppState {
+        db: pool,
+        job_queue,
+        media_location: cfg.media_location,
+        web_root: cfg.web_root.clone(),
+    };
+
+    let web_root = PathBuf::from(cfg.web_root);
+    let index_html = web_root.join("index.html");
 
     let app = Router::new()
         .merge(controllers::app::router())
@@ -101,7 +112,10 @@ async fn main() -> anyhow::Result<()> {
         .merge(controllers::socket::router())
         .layer(DefaultBodyLimit::disable())
         .with_state(state.clone())
-        .layer(TraceLayer::new_for_http());
+        .layer(TraceLayer::new_for_http())
+        .fallback_service(
+            ServeDir::new(&web_root).not_found_service(ServeFile::new(index_html)),
+        );
 
     let addr = SocketAddr::from(([0, 0, 0, 0], cfg.port));
     tracing::debug!("Listening on {}", addr);

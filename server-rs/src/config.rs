@@ -8,6 +8,8 @@ pub struct AppConfig {
     pub db_url: String,
     #[serde(default = "default_media_location")]
     pub media_location: String,
+    #[serde(default = "default_web_root")]
+    pub web_root: String,
     #[serde(default = "default_redis_hostname")]
     pub redis_hostname: String,
     #[serde(default = "default_redis_port")]
@@ -32,6 +34,10 @@ fn default_media_location() -> String {
     "/root/immich/upload".to_string()
 }
 
+fn default_web_root() -> String {
+    "/usr/share/immich-web".to_string()
+}
+
 fn default_redis_hostname() -> String {
     "redis".to_string()
 }
@@ -46,6 +52,7 @@ pub fn load() -> AppConfig {
         port: default_port(),
         db_url: "".to_string(),
         media_location: default_media_location(),
+        web_root: default_web_root(),
         redis_hostname: default_redis_hostname(),
         redis_port: default_redis_port(),
         redis_dbindex: 0,
