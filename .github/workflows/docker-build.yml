@@ -61,8 +61,8 @@ jobs:
       - name: Build and push immich-machine-learning
         uses: docker/build-push-action@v6
         with:
-          context: .
-          file: machine-learning/Dockerfile
+          context: ./machine-learning
+          file: Dockerfile
           push: true
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/immich-machine-learning:latest
