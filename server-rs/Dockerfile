@@ -17,7 +17,6 @@ RUN mkdir -p src && \
 COPY server-rs/src /usr/src/app/server-rs/src
 COPY server-rs/migrations /usr/src/app/server-rs/migrations
 COPY server/package.json /usr/src/app/server/package.json
-COPY server-rs/.env /usr/src/app/server-rs/.env
 
 RUN cargo clean && cargo build --release --locked
 
