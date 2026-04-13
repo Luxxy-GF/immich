@@ -1,7 +1,7 @@
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        Query,
+        Query, State,
     },
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
@@ -9,6 +9,7 @@ use axum::{
     Router,
 };
 use serde::Deserialize;
+use tokio::sync::broadcast;
 use tokio::time::{interval_at, Duration, Instant};
 use uuid::Uuid;
 
@@ -31,6 +32,7 @@ async fn websocket_upgrade(
     ws: Option<WebSocketUpgrade>,
     headers: HeaderMap,
     Query(query): Query<SocketIoQuery>,
+    State(state): State<AppState>,
 ) -> Response {
     let transport = query.transport.as_deref().unwrap_or_default();
     let is_websocket_transport = transport.eq_ignore_ascii_case("websocket");
@@ -41,7 +43,8 @@ async fn websocket_upgrade(
 
     if let Some(ws) = ws {
         let _ = query.eio.as_deref();
-        return ws.on_upgrade(handle_socket).into_response();
+        let rx = state.socket_tx.subscribe();
+        return ws.on_upgrade(move |socket| handle_socket(socket, rx)).into_response();
     }
 
     if is_websocket_transport || has_upgrade_header {
@@ -66,7 +69,7 @@ async fn websocket_upgrade(
         .into_response()
 }
 
-async fn handle_socket(mut socket: WebSocket) {
+async fn handle_socket(mut socket: WebSocket, mut rx: broadcast::Receiver<String>) {
     let sid = Uuid::new_v4().to_string();
     let open_packet = format!(
         "0{{\"sid\":\"{sid}\",\"upgrades\":[],\"pingInterval\":25000,\"pingTimeout\":20000,\"maxPayload\":1000000}}"
@@ -88,6 +91,21 @@ async fn handle_socket(mut socket: WebSocket) {
             _ = ping_interval.tick() => {
                 if socket.send(Message::Text("2".into())).await.is_err() {
                     break;
+                }
+            }
+            msg = rx.recv() => {
+                match msg {
+                    Ok(payload) => {
+                        if socket.send(Message::Text(payload.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        continue;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        break;
+                    }
                 }
             }
             message = socket.recv() => {

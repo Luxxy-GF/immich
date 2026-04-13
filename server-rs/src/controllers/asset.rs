@@ -253,6 +253,10 @@ async fn upload_asset(
         if generate_initial_media(&state, &asset).await.is_err() {
             tracing::warn!("eager media generation failed for {}", asset.id);
         }
+        let payload = serde_json::to_string(&map_asset(asset)).unwrap_or_else(|_| "{}".to_string());
+        let _ = state
+            .socket_tx
+            .send(format!("42[\"on_upload_success\",{payload}]"));
     }
 
     let _ = state
@@ -573,7 +577,8 @@ async fn download_asset_original(
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
     let asset = load_asset(&state, &auth.user.id, &id).await?;
-    serve_file(asset.original_path, asset.original_file_name, false).await
+    let path = resolve_original_path(&state, &asset).await?;
+    serve_file(path, asset.original_file_name, false).await
 }
 async fn replace_asset_original() -> Result<Json<AssetMediaResponseDto>, AppError> { Ok(Json(AssetMediaResponseDto { id: uuid::Uuid::new_v4().to_string(), duplicate: false, status: "replaced".to_string() })) }
 async fn view_asset_thumbnail(
@@ -587,7 +592,8 @@ async fn view_asset_thumbnail(
     let size = query.size.unwrap_or_else(|| "thumbnail".to_string());
 
     if size == "fullsize" && asset.r#type.eq_ignore_ascii_case("IMAGE") && is_web_supported_image(&asset.original_file_name) && query.edited != Some(true) {
-        return serve_file(asset.original_path, asset.original_file_name, false).await;
+        let path = resolve_original_path(&state, &asset).await?;
+        return serve_file(path, asset.original_file_name, false).await;
     }
 
     let derivative_type = match size.as_str() {
@@ -610,7 +616,7 @@ async fn play_asset_video(
     } else {
         get_asset_file_path(&state, &asset.id, "encoded_video", false)
             .await?
-            .unwrap_or(asset.original_path.clone())
+            .unwrap_or(resolve_original_path(&state, &asset).await?)
     };
     serve_known_file(path, "video/mp4", false).await
 }
@@ -722,6 +728,34 @@ async fn serve_known_file(path: String, content_type: &str, attachment: bool) ->
     Ok((headers, bytes).into_response())
 }
 
+async fn resolve_original_path(state: &AppState, asset: &Asset) -> Result<String, AppError> {
+    if tokio::fs::try_exists(&asset.original_path).await.unwrap_or(false) {
+        return Ok(asset.original_path.clone());
+    }
+
+    let extension = std::path::Path::new(&asset.original_file_name)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("bin");
+    let candidate = build_upload_path(&state.media_location, &asset.owner_id, &asset.id, extension);
+    if tokio::fs::try_exists(&candidate).await.unwrap_or(false) {
+        sqlx::query(
+            r#"
+            UPDATE "asset"
+            SET "originalPath" = $1, "updatedAt" = NOW()
+            WHERE "id" = $2::uuid
+            "#,
+        )
+        .bind(&candidate)
+        .bind(&asset.id)
+        .execute(&state.db)
+        .await?;
+        return Ok(candidate);
+    }
+
+    Ok(asset.original_path.clone())
+}
+
 fn guess_content_type(file_name: &str) -> &'static str {
     match file_name.rsplit('.').next().unwrap_or_default().to_ascii_lowercase().as_str() {
         "jpg" | "jpeg" => "image/jpeg",
@@ -749,7 +783,8 @@ async fn ensure_derivative(state: &AppState, asset: &Asset, derivative_type: &st
         tokio::fs::create_dir_all(parent).await.map_err(|e| AppError::InternalServerError(e.into()))?;
     }
 
-    generate_derivative(asset, derivative_type, &output_path, config)?;
+    let original_path = resolve_original_path(state, asset).await?;
+    generate_derivative(asset, &original_path, derivative_type, &output_path, config)?;
     upsert_asset_file(state, &asset.id, derivative_type, &output_path, false).await?;
 
     Ok(output_path)
@@ -763,7 +798,7 @@ async fn ensure_encoded_video(state: &AppState, asset: &Asset, _config: &MediaCo
     }
 
     if asset.r#type.eq_ignore_ascii_case("VIDEO") && is_web_playable_video(&asset.original_file_name) {
-        return Ok(asset.original_path.clone());
+        return Ok(resolve_original_path(state, asset).await?);
     }
 
     let output_path = build_encoded_video_path(&state.media_location, &asset.owner_id, &asset.id);
@@ -771,14 +806,15 @@ async fn ensure_encoded_video(state: &AppState, asset: &Asset, _config: &MediaCo
         tokio::fs::create_dir_all(parent).await.map_err(|e| AppError::InternalServerError(e.into()))?;
     }
 
-    generate_encoded_video(asset, &output_path)?;
+    let original_path = resolve_original_path(state, asset).await?;
+    generate_encoded_video(&original_path, &output_path)?;
 
     upsert_asset_file(state, &asset.id, "encoded_video", &output_path, false).await?;
 
     Ok(output_path)
 }
 
-fn generate_derivative(asset: &Asset, derivative_type: &str, output_path: &str, config: &MediaConfig) -> Result<(), AppError> {
+fn generate_derivative(asset: &Asset, original_path: &str, derivative_type: &str, output_path: &str, config: &MediaConfig) -> Result<(), AppError> {
     let (target, format) = match derivative_type {
         "preview" => (config.preview_size, config.preview_format.as_str()),
         "fullsize" => (config.preview_size.max(2160), config.fullsize_format.as_str()),
@@ -790,7 +826,7 @@ fn generate_derivative(asset: &Asset, derivative_type: &str, output_path: &str, 
     if asset.r#type.eq_ignore_ascii_case("VIDEO") {
         cmd.args(["-ss", "00:00:00.000"]);
     }
-    cmd.args(["-i", &asset.original_path]);
+    cmd.args(["-i", original_path]);
     cmd.args(["-frames:v", "1"]);
     cmd.args(["-vf", &format!("scale='min({target},iw)':-2")]);
     cmd.args(["-q:v", "3"]);
@@ -808,12 +844,12 @@ fn generate_derivative(asset: &Asset, derivative_type: &str, output_path: &str, 
     Ok(())
 }
 
-fn generate_encoded_video(asset: &Asset, output_path: &str) -> Result<(), AppError> {
+fn generate_encoded_video(original_path: &str, output_path: &str) -> Result<(), AppError> {
     let output = Command::new("ffmpeg")
         .args([
             "-y",
             "-i",
-            &asset.original_path,
+            original_path,
             "-movflags",
             "+faststart",
             "-pix_fmt",

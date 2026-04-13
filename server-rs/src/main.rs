@@ -13,6 +13,7 @@ use sqlx::postgres::PgPoolOptions;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::sync::broadcast;
 use tower_http::trace::TraceLayer;
 use tower_http::services::{ServeDir, ServeFile};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -25,6 +26,7 @@ pub struct AppState {
     pub job_queue: Arc<JobQueue>,
     pub media_location: String,
     pub web_root: String,
+    pub socket_tx: broadcast::Sender<String>,
 }
 
 #[tokio::main]
@@ -57,11 +59,14 @@ async fn main() -> anyhow::Result<()> {
     let (job_queue, receiver) = JobQueue::new();
     let job_queue = Arc::new(job_queue);
 
+    let (socket_tx, _) = broadcast::channel(1024);
+
     let state = AppState {
         db: pool,
         job_queue: job_queue.clone(),
         media_location: cfg.media_location,
         web_root: cfg.web_root.clone(),
+        socket_tx,
     };
 
     tokio::spawn({
