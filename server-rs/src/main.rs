@@ -58,6 +58,7 @@ async fn main() -> anyhow::Result<()> {
         
     let (job_queue, receiver) = JobQueue::new();
     let job_queue = Arc::new(job_queue);
+    let receiver = Arc::new(tokio::sync::Mutex::new(receiver));
 
     let (socket_tx, _) = broadcast::channel(1024);
 
@@ -69,12 +70,16 @@ async fn main() -> anyhow::Result<()> {
         socket_tx,
     };
 
-    tokio::spawn({
-        let worker_state = state.clone();
-        async move {
-            run_worker(receiver, worker_state).await;
-        }
-    });
+    let worker_count = cfg.job_worker_concurrency.max(1);
+    for worker_id in 0..worker_count {
+        tokio::spawn({
+            let worker_state = state.clone();
+            let receiver = receiver.clone();
+            async move {
+                run_worker(receiver, worker_state, worker_id + 1).await;
+            }
+        });
+    }
 
     let web_root = PathBuf::from(cfg.web_root);
     let index_html = web_root.join("index.html");

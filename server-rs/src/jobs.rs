@@ -91,12 +91,20 @@ impl JobQueue {
     }
 }
 
-pub async fn run_worker(mut receiver: mpsc::Receiver<Job>, state: AppState) {
-    info!("Background job worker started");
-    while let Some(job) = receiver.recv().await {
+pub async fn run_worker(receiver: Arc<Mutex<mpsc::Receiver<Job>>>, state: AppState, worker_id: usize) {
+    info!("Background job worker started ({worker_id})");
+    loop {
+        let job = {
+            let mut receiver = receiver.lock().await;
+            receiver.recv().await
+        };
+
+        let Some(job) = job else {
+            break;
+        };
         process_job(job, &state).await;
     }
-    info!("Background job worker exited");
+    info!("Background job worker exited ({worker_id})");
 }
 
 async fn process_job(job: Job, state: &AppState) {

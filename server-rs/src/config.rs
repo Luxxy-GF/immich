@@ -24,6 +24,8 @@ pub struct AppConfig {
     pub redis_socket: String,
     #[serde(default)]
     pub redis_url: String,
+    #[serde(default = "default_job_worker_concurrency")]
+    pub job_worker_concurrency: usize,
 }
 
 fn default_port() -> u16 {
@@ -46,6 +48,10 @@ fn default_redis_port() -> u16 {
     6379
 }
 
+fn default_job_worker_concurrency() -> usize {
+    4
+}
+
 pub fn load() -> AppConfig {
     dotenvy::dotenv().ok();
     envy::from_env::<AppConfig>().unwrap_or_else(|_| AppConfig {
@@ -60,5 +66,6 @@ pub fn load() -> AppConfig {
         redis_password: "".to_string(),
         redis_socket: "".to_string(),
         redis_url: "".to_string(),
+        job_worker_concurrency: default_job_worker_concurrency(),
     })
 }
