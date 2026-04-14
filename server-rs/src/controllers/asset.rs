@@ -250,13 +250,28 @@ async fn upload_asset(
     .await?;
 
     if let Ok(asset) = load_asset(&state, &_auth.user.id, &asset_id).await {
-        if generate_initial_media(&state, &asset).await.is_err() {
-            tracing::warn!("eager media generation failed for {}", asset.id);
-        }
-        let payload = serde_json::to_string(&map_asset(asset)).unwrap_or_else(|_| "{}".to_string());
+        let payload = serde_json::to_string(&map_asset(asset.clone())).unwrap_or_else(|_| "{}".to_string());
         let _ = state
             .socket_tx
             .send(format!("42[\"on_upload_success\",{payload}]"));
+
+        let _ = state
+            .job_queue
+            .enqueue(Job::GenerateThumbnail {
+                id: Uuid::new_v4().to_string(),
+                asset_id: asset.id.clone(),
+            })
+            .await;
+
+        if asset.r#type.eq_ignore_ascii_case("VIDEO") && !is_web_playable_video(&asset.original_file_name) {
+            let _ = state
+                .job_queue
+                .enqueue(Job::TranscodeVideo {
+                    id: Uuid::new_v4().to_string(),
+                    asset_id: asset.id.clone(),
+                })
+                .await;
+        }
     }
 
     let _ = state
@@ -986,11 +1001,19 @@ pub(crate) async fn run_media_job(state: &AppState, job: &Job) -> Result<(), App
         Job::GenerateThumbnail { asset_id, .. } => {
             let asset = load_asset_by_id(state, asset_id).await?;
             generate_initial_media(state, &asset).await?;
+            let payload = serde_json::to_string(&map_asset(asset)).unwrap_or_else(|_| "{}".to_string());
+            let _ = state
+                .socket_tx
+                .send(format!("42[\"on_asset_update\",{payload}]"));
         }
         Job::TranscodeVideo { asset_id, .. } => {
             let asset = load_asset_by_id(state, asset_id).await?;
             let config = load_media_config(state).await?;
             let _ = ensure_encoded_video(state, &asset, &config).await?;
+            let payload = serde_json::to_string(&map_asset(asset)).unwrap_or_else(|_| "{}".to_string());
+            let _ = state
+                .socket_tx
+                .send(format!("42[\"on_asset_update\",{payload}]"));
         }
         Job::SmartSearch { asset_id, .. } => {
             let asset = load_asset_by_id(state, asset_id).await?;

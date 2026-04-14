@@ -1,0 +1,6 @@
+#!/bin/sh
+set -eu
+
+PORT_VALUE="${PORT:-2283}"
+
+curl --fail --silent --show-error "http://127.0.0.1:${PORT_VALUE}/api/server/ping" >/dev/null
