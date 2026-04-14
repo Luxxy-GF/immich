@@ -99,7 +99,7 @@ async fn get_memories(
                 a.thumbhash,
                 a."livePhotoVideoId"::text as "livePhotoVideoId",
                 a.duration,
-                a.visibility,
+                a.visibility::text as visibility,
                 a.width,
                 a.height
             FROM memory_asset ma
